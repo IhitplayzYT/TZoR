@@ -1,0 +1,525 @@
+use std::f32;
+
+#[allow(non_snake_case,non_camel_case_types,dead_code)]
+use crate::dtype::{Element, Float};
+use crate::error::{TensorResult, TensorError};
+#[cfg(feature = "cuda")]
+use crate::layout::normalize_dim;
+use crate::layout::{broadcast_shapes, Layout};
+use crate::par;
+use crate::storage::Storage;
+use crate::tensor::Tensor;
+
+impl<T: Element> Tensor<T> {
+
+    /// Convolve NCHW input with OIHW filters. CPU work is parallelized across
+    /// output elements. CUDA currently uses the tensor library's host fallback.
+    pub fn conv2d(&self, weight: &Self, bias: Option<&Self>, stride: (usize, usize), padding: (usize, usize)) -> TensorResult<Self> {
+        self.same_device(weight)?;
+        if let Some(b) = bias { self.same_device(b)?; }
+        if self.ndim() != 4 || weight.ndim() != 4 || stride.0 == 0 || stride.1 == 0 {
+            return Err(TensorError::InvalidShape("conv2d expects NCHW input, OIHW weights, and positive strides".into()));
+        }
+        let (n, c, h, w) = (self.shape()[0], self.shape()[1], self.shape()[2], self.shape()[3]);
+        let (oc, wc, kh, kw) = (weight.shape()[0], weight.shape()[1], weight.shape()[2], weight.shape()[3]);
+        if c != wc { return Err(TensorError::ShapeMismatch { op: "conv2d channels", lhs: self.shape().to_vec(), rhs: weight.shape().to_vec() }); }
+        if kh == 0 || kw == 0 || h + 2 * padding.0 < kh || w + 2 * padding.1 < kw {
+            return Err(TensorError::InvalidShape("conv2d kernel does not fit the padded input".into()));
+        }
+        if let Some(b) = bias { if b.numel() != oc { return Err(TensorError::ShapeMismatch { op: "conv2d bias", lhs: vec![oc], rhs: b.shape().to_vec() }); } }
+        let (oh, ow) = ((h + 2 * padding.0 - kh) / stride.0 + 1, (w + 2 * padding.1 - kw) / stride.1 + 1);
+        self.via_host(|x| {
+            let xv = x.compact()?.to_vec()?;
+            let wv = weight.cpu()?.compact()?.to_vec()?;
+            let bv = bias.map(|b| b.cpu()?.compact()?.to_vec()).transpose()?;
+            let out = par::map_range(n * oc * oh * ow, |flat| {
+                let ox = flat % ow;
+                let oy = flat / ow % oh;
+                let out_c = flat / (ow * oh) % oc;
+                let batch = flat / (ow * oh * oc);
+                let mut sum = bv.as_ref().map_or(T::zero(), |b| b[out_c]);
+                for in_c in 0..c { for ky in 0..kh {
+                    let iy = oy as isize * stride.0 as isize + ky as isize - padding.0 as isize;
+                    if iy < 0 || iy >= h as isize { continue; }
+                    for kx in 0..kw {
+                        let ix = ox as isize * stride.1 as isize + kx as isize - padding.1 as isize;
+                        if ix < 0 || ix >= w as isize { continue; }
+                        sum += xv[((batch * c + in_c) * h + iy as usize) * w + ix as usize]
+                            * wv[((out_c * c + in_c) * kh + ky) * kw + kx];
+                    }
+                }}
+                sum
+            });
+            Tensor::from_vec(out, &[n, oc, oh, ow])
+        })
+    }
+
+    /// Return gradients for input, OIHW filters, and broadcast bias of a
+    /// convolution. The bias gradient has shape `[1, out_channels, 1, 1]`.
+    pub fn conv2d_backward(&self, weight: &Self, output_gradient: &Self, stride: (usize, usize), padding: (usize, usize)) -> TensorResult<(Self, Self, Self)> {
+        self.same_device(weight)?;
+        self.same_device(output_gradient)?;
+        if self.ndim() != 4 || weight.ndim() != 4 || output_gradient.ndim() != 4 || stride.0 == 0 || stride.1 == 0 {
+            return Err(TensorError::InvalidShape("conv2d_backward expects rank-four tensors and positive strides".into()));
+        }
+        let (n, c, h, w) = (self.shape()[0], self.shape()[1], self.shape()[2], self.shape()[3]);
+        let (oc, wc, kh, kw) = (weight.shape()[0], weight.shape()[1], weight.shape()[2], weight.shape()[3]);
+        if c != wc || h + 2 * padding.0 < kh || w + 2 * padding.1 < kw {
+            return Err(TensorError::ShapeMismatch { op: "conv2d_backward", lhs: self.shape().to_vec(), rhs: weight.shape().to_vec() });
+        }
+        let (oh, ow) = ((h + 2 * padding.0 - kh) / stride.0 + 1, (w + 2 * padding.1 - kw) / stride.1 + 1);
+        if output_gradient.shape() != [n, oc, oh, ow] {
+            return Err(TensorError::ShapeMismatch { op: "conv2d_backward gradient", lhs: vec![n, oc, oh, ow], rhs: output_gradient.shape().to_vec() });
+        }
+        let xv = self.cpu()?.compact()?.to_vec()?;
+        let wv = weight.cpu()?.compact()?.to_vec()?;
+        let gv = output_gradient.cpu()?.compact()?.to_vec()?;
+        let dx = par::map_range(n * c * h * w, |flat| {
+            let ix = flat % w;
+            let iy = flat / w % h;
+            let in_c = flat / (w * h) % c;
+            let batch = flat / (w * h * c);
+            let mut sum = T::zero();
+            for out_c in 0..oc { for ky in 0..kh {
+                let oy_num = iy as isize + padding.0 as isize - ky as isize;
+                if oy_num < 0 || oy_num as usize % stride.0 != 0 { continue; }
+                let oy = oy_num as usize / stride.0;
+                if oy >= oh { continue; }
+                for kx in 0..kw {
+                    let ox_num = ix as isize + padding.1 as isize - kx as isize;
+                    if ox_num < 0 || ox_num as usize % stride.1 != 0 { continue; }
+                    let ox = ox_num as usize / stride.1;
+                    if ox < ow { sum += gv[((batch * oc + out_c) * oh + oy) * ow + ox] * wv[((out_c * c + in_c) * kh + ky) * kw + kx]; }
+                }
+            }}
+            sum
+        });
+        let dw = par::map_range(oc * c * kh * kw, |flat| {
+            let kx = flat % kw;
+            let ky = flat / kw % kh;
+            let in_c = flat / (kw * kh) % c;
+            let out_c = flat / (kw * kh * c);
+            let mut sum = T::zero();
+            for batch in 0..n { for oy in 0..oh {
+                let iy = oy as isize * stride.0 as isize + ky as isize - padding.0 as isize;
+                if iy < 0 || iy >= h as isize { continue; }
+                for ox in 0..ow {
+                    let ix = ox as isize * stride.1 as isize + kx as isize - padding.1 as isize;
+                    if ix >= 0 && ix < w as isize {
+                        sum += xv[((batch * c + in_c) * h + iy as usize) * w + ix as usize] * gv[((batch * oc + out_c) * oh + oy) * ow + ox];
+                    }
+                }
+            }}
+            sum
+        });
+        let db = par::map_range(oc, |out_c| {
+            let mut sum = T::zero();
+            for batch in 0..n { for oy in 0..oh { for ox in 0..ow { sum += gv[((batch * oc + out_c) * oh + oy) * ow + ox]; }}}
+            sum
+        });
+        Ok((
+            Tensor::from_vec(dx, &[n, c, h, w])?.to_device(self.device())?,
+            Tensor::from_vec(dw, &[oc, c, kh, kw])?.to_device(self.device())?,
+            Tensor::from_vec(db, &[1, oc, 1, 1])?.to_device(self.device())?,
+        ))
+    }
+
+    /// Max pool over NCHW spatial dimensions. Returned indices are absolute
+    /// flattened input positions for use by `max_pool2d_backward`.
+    pub fn max_pool2d_with_indices(&self, kernel: (usize, usize), stride: (usize, usize), padding: (usize, usize)) -> TensorResult<(Self, Tensor<i64>)> {
+        let (n, c, h, w, oh, ow) = pool2d_shape(self.shape(), kernel, stride, padding)?;
+        let x = self.cpu()?.compact()?.to_vec()?;
+        let pairs = par::map_range(n * c * oh * ow, |flat| {
+            let (ox, oy, ch, batch) = (flat % ow, flat / ow % oh, flat / (ow * oh) % c, flat / (ow * oh * c));
+            let (mut max, mut winner) = (T::lowest(), -1i64);
+            for ky in 0..kernel.0 { for kx in 0..kernel.1 {
+                let (iy, ix) = (oy as isize * stride.0 as isize + ky as isize - padding.0 as isize, ox as isize * stride.1 as isize + kx as isize - padding.1 as isize);
+                if iy < 0 || iy >= h as isize || ix < 0 || ix >= w as isize { continue; }
+                let i = ((batch * c + ch) * h + iy as usize) * w + ix as usize;
+                if winner < 0 || x[i] > max { max = x[i]; winner = i as i64; }
+            }}
+            (max, winner)
+        });
+        let values = pairs.iter().map(|x| x.0).collect();
+        let indices = pairs.into_iter().map(|x| x.1).collect();
+        Ok((Tensor::from_vec(values, &[n, c, oh, ow])?.to_device(self.device())?, Tensor::from_vec(indices, &[n, c, oh, ow])?.to_device(self.device())?))
+    }
+
+    /// Backpropagate gradients through max pooling, accumulating overlapping
+    /// window contributions at each winning input position.
+    pub fn max_pool2d_backward(&self, indices: &Tensor<i64>, output_gradient: &Self, kernel: (usize, usize), stride: (usize, usize), padding: (usize, usize)) -> TensorResult<Self> {
+        self.same_device(output_gradient)?;
+        if indices.device() != self.device() { return Err(TensorError::DeviceMismatch { lhs: self.device(), rhs: indices.device() }); }
+        let (n, c, h, w, oh, ow) = pool2d_shape(self.shape(), kernel, stride, padding)?;
+        if indices.shape() != [n, c, oh, ow] || output_gradient.shape() != [n, c, oh, ow] {
+            return Err(TensorError::ShapeMismatch { op: "max_pool2d_backward", lhs: vec![n, c, oh, ow], rhs: output_gradient.shape().to_vec() });
+        }
+        let winners = indices.cpu()?.to_vec()?;
+        let grads = output_gradient.cpu()?.compact()?.to_vec()?;
+        let dx = par::map_range(n * c * h * w, |i| {
+            let mut sum = T::zero();
+            for (j, &winner) in winners.iter().enumerate() { if winner == i as i64 { sum += grads[j]; } }
+            sum
+        });
+        Tensor::from_vec(dx, &[n, c, h, w])?.to_device(self.device())
+    }
+
+    /// Average pool over NCHW spatial dimensions.
+    pub fn avg_pool2d(&self, kernel: (usize, usize), stride: (usize, usize), padding: (usize, usize), count_include_pad: bool) -> TensorResult<Self> where T: Float {
+        let (n, c, h, w, oh, ow) = pool2d_shape(self.shape(), kernel, stride, padding)?;
+        let x = self.cpu()?.compact()?.to_vec()?;
+        let out = par::map_range(n * c * oh * ow, |flat| {
+            let (ox, oy, ch, batch) = (flat % ow, flat / ow % oh, flat / (ow * oh) % c, flat / (ow * oh * c));
+            let (mut sum, mut count) = (T::zero(), 0usize);
+            for ky in 0..kernel.0 { for kx in 0..kernel.1 {
+                let (iy, ix) = (oy as isize * stride.0 as isize + ky as isize - padding.0 as isize, ox as isize * stride.1 as isize + kx as isize - padding.1 as isize);
+                if iy < 0 || iy >= h as isize || ix < 0 || ix >= w as isize { continue; }
+                sum += x[((batch * c + ch) * h + iy as usize) * w + ix as usize];
+                count += 1;
+            }}
+            let divisor = if count_include_pad { kernel.0 * kernel.1 } else { count.max(1) };
+            sum / T::from_f64(divisor as f64)
+        });
+        Tensor::from_vec(out, &[n, c, oh, ow])?.to_device(self.device())
+    }
+
+    /// Average-pool backward pass, preserving overlap accumulation.
+    pub fn avg_pool2d_backward(&self, output_gradient: &Self, kernel: (usize, usize), stride: (usize, usize), padding: (usize, usize), count_include_pad: bool) -> TensorResult<Self> where T: Float {
+        self.same_device(output_gradient)?;
+        let (n, c, h, w, oh, ow) = pool2d_shape(self.shape(), kernel, stride, padding)?;
+        if output_gradient.shape() != [n, c, oh, ow] {
+            return Err(TensorError::ShapeMismatch { op: "avg_pool2d_backward", lhs: vec![n, c, oh, ow], rhs: output_gradient.shape().to_vec() });
+        }
+        let grads = output_gradient.cpu()?.compact()?.to_vec()?;
+        let dx = par::map_range(n * c * h * w, |flat| {
+            let ix = flat % w;
+            let iy = flat / w % h;
+            let ch = flat / (w * h) % c;
+            let batch = flat / (w * h * c);
+            let mut sum = T::zero();
+            for oy in 0..oh { for ox in 0..ow {
+                let y0 = oy as isize * stride.0 as isize - padding.0 as isize;
+                let x0 = ox as isize * stride.1 as isize - padding.1 as isize;
+                if (iy as isize) < y0 || iy as isize >= y0 + kernel.0 as isize || (ix as isize) < x0 || ix as isize >= x0 + kernel.1 as isize { continue; }
+                let valid_h = (0..kernel.0).filter(|&ky| y0 + (ky as isize) >= 0 && y0 + (ky as isize) < h as isize).count();
+                let valid_w = (0..kernel.1).filter(|&kx| x0 + (kx as isize) >= 0 && x0 + (kx as isize) < w as isize).count();
+                let divisor = if count_include_pad { kernel.0 * kernel.1 } else { (valid_h * valid_w).max(1) };
+                sum += grads[((batch * c + ch) * oh + oy) * ow + ox] / T::from_f64(divisor as f64);
+            }}
+            sum
+        });
+        Tensor::from_vec(dx, &[n, c, h, w])?.to_device(self.device())
+    }
+
+    /// Matrix multiplication 
+    pub fn matmul(&self, rhs: &Self) -> TensorResult<Self> {
+        self.same_device(rhs)?;
+        if self.ndim() == 0 || rhs.ndim() == 0 { return Err(TensorError::InvalidShape("Matrix multiplication requires atleast 1D operands".into()));}
+        let (sa, sb) = (self.ndim() == 1, rhs.ndim() == 1);
+        // Since A(p,) B(p,) so to get output as 1x1 we unsqueeze them at diff dims so A(1,p) and B(p,1)  -> C(1,1)
+        let a = if sa { self.unsqueeze(0)? } else { self.clone() };
+        let b = if sb { rhs.unsqueeze(1)? } else { rhs.clone() };
+        let (na, nb) = (a.ndim(), b.ndim());
+        let (shape_a,shape_b) = (a.shape(),b.shape());
+        let (m, k1) = (shape_a[na - 2], shape_a[na - 1]);
+        let (k2, n) = (shape_b[nb - 2], shape_b[nb - 1]);
+        if k1 != k2 { return Err(TensorError::ShapeMismatch { op: "Matmul", lhs: self.shape().to_vec(), rhs: rhs.shape().to_vec() });}
+        let ret_shape = broadcast_shapes(&a.shape()[..na - 2], &b.shape()[..nb - 2])?; // Allocate a larger dim tensor exclusive of the two dims involved in matmul
+        let out = match (&*a.storage, &*b.storage) {
+            (Storage::Cpu(_), Storage::Cpu(_)) => cpu_matmul(&a, &b, &ret_shape, m, k1, n)?,
+            #[cfg(feature = "cuda")]
+            _ => crate::cuda::matmul(&a, &b, &ret_shape, m, k1, n)?,
+        };
+        let mut final_shape = ret_shape;
+        if !sa { final_shape.push(m); }
+        if !sb { final_shape.push(n); }
+        out.reshape(&final_shape.iter().map(|x| *x as isize).collect::<Vec<isize>>())
+    }
+    
+    pub fn dot(&self, rhs: &Self) -> TensorResult<Self> {
+        if self.shape().last() != rhs.shape().last() || self.ndim() == 0 { return Err(TensorError::ShapeMismatch { op: "Dot", lhs: self.shape().to_vec(), rhs: rhs.shape().to_vec() });}
+        self.mul(rhs)?.sum(-1, false)
+    }
+
+    /// Cross product of 3 vectors along the last dim (batch dims broadcast).
+    /// Here the 3 vectors mean the last dim needs to have 3 elems
+    // Generated by AI
+    pub fn cross(&self, rhs: &Self) -> TensorResult<Self> {
+        if self.shape().last() != Some(&3) || rhs.shape().last() != Some(&3) { return Err(TensorError::ShapeMismatch { op: "Cross", lhs: self.shape().to_vec(), rhs: rhs.shape().to_vec() });}
+        let (a0, a1, a2) = (self.select(-1, 0)?, self.select(-1, 1)?, self.select(-1, 2)?);
+        let (b0, b1, b2) = (rhs.select(-1, 0)?, rhs.select(-1, 1)?, rhs.select(-1, 2)?);
+        let c0 = a1.mul(&b2)?.sub(&a2.mul(&b1)?)?;
+        let c1 = a2.mul(&b0)?.sub(&a0.mul(&b2)?)?;
+        let c2 = a0.mul(&b1)?.sub(&a1.mul(&b0)?)?;
+        Tensor::stack(&[&c0, &c1, &c2], -1)
+    }
+
+    pub fn outer(&self, rhs: &Self) -> TensorResult<Self> {
+        if self.ndim() != 1 || rhs.ndim() != 1 { return Err(TensorError::InvalidShape("Outer expects 1D tensors".into()));}
+        self.unsqueeze(1)?.mul(&rhs.unsqueeze(0)?)
+    }
+
+    /// Used to convert 1D Tensor to 2D diagonal Tensor. eg: [1,2,4,5] -> [[1,0,0,0],[0,2,0,0],[0,0,4,0],[0,0,0,5]]
+    /// Used to convert 2D Tensor to 1D Tensor by taking diagonal elems and converting them into single 1D. eg:  [[1,4,5,2],[9,2,20,13],[0,0,4,0],[9,4,5,5]] -> [1,2,4,5]
+    pub fn diag(&self) -> TensorResult<Self> {
+        self.via_host(|t| match t.ndim() {
+            1 => {
+                let n = t.numel();
+                let v = t.to_vec()?;
+                Ok(Tensor::from_fn(&[n, n], |ix| if ix[0] == ix[1] { v[ix[0]] } else { T::zero() }))
+            }
+            2 => {
+                let n = t.shape()[0].min(t.shape()[1]);
+                let d: Vec<T> = (0..n).map(|i| t.get(&[i, i])).collect::<TensorResult<_>>()?;
+                Tensor::from_vec(d, &[n])
+            }
+            _ => Err(TensorError::InvalidShape("Diag expects 1D or 2D".into())),
+        })
+    }
+    /// Get trace of a vector
+    pub fn trace(&self) -> TensorResult<T> { 
+        self.diag()?.sum_all() 
+    }
+}
+
+/// Interior use function generated completely by AI 
+fn pool2d_shape(shape: &[usize], kernel: (usize, usize), stride: (usize, usize), padding: (usize, usize)) -> TensorResult<(usize, usize, usize, usize, usize, usize)> {
+    if shape.len() != 4 || kernel.0 == 0 || kernel.1 == 0 || stride.0 == 0 || stride.1 == 0 {
+        return Err(TensorError::InvalidShape("pool2d expects NCHW rank-four input and positive kernel/stride".into()));
+    }
+    let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+    if h + 2 * padding.0 < kernel.0 || w + 2 * padding.1 < kernel.1 {
+        return Err(TensorError::InvalidShape("pool2d kernel does not fit padded input".into()));
+    }
+    let oh = (h + 2 * padding.0 - kernel.0) / stride.0 + 1;
+    let ow = (w + 2 * padding.1 - kernel.1) / stride.1 + 1;
+    Ok((n, c, h, w, oh, ow))
+}
+
+fn cpu_matmul<T: Element>(a: &Tensor<T>, b: &Tensor<T>, batch: &[usize], m: usize, k: usize, n: usize) -> TensorResult<Tensor<T>> {
+    let (na, nb) = (a.ndim(), b.ndim());
+    
+    let b = if b.strides()[nb - 1] != 1 && n > 1 { b.compact()? } else { b.clone() };
+    let nb = b.ndim();
+
+    let batch_offsets = |t: &Tensor<T>, nd: usize| -> TensorResult<Vec<usize>> {
+        let l = Layout::new(t.shape()[..nd - 2].to_vec(), t.strides()[..nd - 2].to_vec(), t.offset())?;
+        Ok(l.broadcast_to(batch)?.offsets().collect())
+    };
+    let a_offs = batch_offsets(a, na)?;
+    let b_offs = batch_offsets(&b, nb)?;
+    let (a_rs, a_cs) = (a.strides()[na - 2], a.strides()[na - 1]);
+    let b_rs = b.strides()[nb - 2];
+    let (sa, sb) = (a.storage.as_cpu().unwrap(), b.storage.as_cpu().unwrap());
+
+    let total_batch: usize = batch.iter().product();
+    let mut out = vec![T::zero(); total_batch * m * n];
+    par::for_each_row(&mut out, n, k * n, |r, row| {
+        let (bi, i) = (r / m, r % m);
+        let (ao, bo) = (a_offs[bi] as isize, b_offs[bi] as isize);
+        for p in 0..k {
+            let aip = sa[(ao + i as isize * a_rs + p as isize * a_cs) as usize];
+            let start = (bo + p as isize * b_rs) as usize;
+            let brow = &sb[start..start + n];
+            for j in 0..n {
+                row[j] = row[j] + aip * brow[j];
+            }
+        }
+    });
+    let mut shape = batch.to_vec();
+    shape.extend([m, n]);
+    Tensor::from_vec(out, &shape)
+}
+
+
+/// Solve linear eqns using gauss jordan with resultant soln written to rhs and returns a determinant is soln is feasible
+// Generated by AI
+pub fn gauss_jordan<T: Float>(lhs: &mut [T], l_lhs: usize, rhs: &mut [T], l_rhs: usize) -> Option<T> {
+    let mut det = T::one();
+    let mut mx = T::zero();
+    for v in lhs.iter() { let a = v.abs(); if a > mx { mx = a; } }
+    let EPS = T::epsilon() * T::from_f64(l_lhs as f64) * mx;
+    for c in 0..l_lhs {
+        let mut p = c;
+        for r in c + 1..l_lhs {
+            if lhs[r * l_lhs + c].abs() > lhs[p * l_lhs + c].abs() { p = r; }
+        }
+        if lhs[p * l_lhs + c].abs() <= EPS { return None; }
+        if p != c {
+            for j in 0..l_lhs { lhs.swap(c * l_lhs + j, p * l_lhs + j); }
+            for j in 0..l_rhs { rhs.swap(c * l_rhs + j, p * l_rhs + j); }
+            det = -det;
+        }
+        let piv = lhs[c * l_lhs + c];
+        det = det * piv;
+        for j in 0..l_lhs { lhs[c * l_lhs + j] = lhs[c * l_lhs + j] / piv; }
+        for j in 0..l_rhs { rhs[c * l_rhs + j] = rhs[c * l_rhs + j] / piv; }
+        for r in 0..l_lhs {
+            if r == c { continue; }
+            let f = lhs[r * l_lhs + c];
+            if f == T::zero() { continue; }
+            for j in 0..l_lhs { lhs[r * l_lhs + j] = lhs[r * l_lhs + j] - f * lhs[c * l_lhs + j]; }
+            for j in 0..l_rhs { rhs[r * l_rhs + j] = rhs[r * l_rhs + j] - f * rhs[c * l_rhs + j]; }
+        }
+    }
+    Some(det)
+}
+
+impl<T: Float> Tensor<T> {
+
+    /// Check if tensor is linear 
+    pub fn is_linear_check(&self) -> TensorResult<usize> {
+        if self.ndim() != 2 || self.shape()[1] != 1 { return Err(TensorError::InvalidShape(format!("Expected a linear Tensor, got {:?}", self.shape())));}
+        Ok(self.shape()[0])
+    }
+
+    /// Check if tensor is square matrix
+    pub fn is_square_check(&self) -> TensorResult<usize> {
+        if self.ndim() != 2 || self.shape()[0] != self.shape()[1] { return Err(TensorError::InvalidShape(format!("Expected a square matrix, got {:?}", self.shape())));}
+        Ok(self.shape()[0])
+    }
+
+    /// Check if tensor is cubic
+    pub fn is_cubic_check(&self) -> TensorResult<usize>{
+        if self.ndim() != 3 || (self.shape()[0] != self.shape()[1] || self.shape()[1] != self.shape()[2]) { return Err(TensorError::InvalidShape(format!("Expected a cubic matrix, got {:?}", self.shape())));}
+        Ok(self.shape()[0])
+    }
+
+    /// Check if tensor is nthbic (Same size accross all n dims) 
+    pub fn is_nthbic_check(&self) -> TensorResult<usize>{
+        let shp = self.shape();
+        if shp.windows(2).any(|x| {x[0] != x[1]}) { return Err(TensorError::InvalidShape(format!("Expected a nthbic Tensor, got {:?}", shp)));}
+        Ok(shp[0])
+    }
+
+    /// Is tensor linear?
+    pub fn is_linear(&self) -> bool {
+        self.ndim() == 2 && self.shape()[1] == 1
+    }
+
+    /// Is tensor square?
+    pub fn is_square(&self) -> bool{
+        self.ndim() == 2 && self.shape()[0] == self.shape()[1]
+    }
+
+    /// Is tensor cubic?
+    pub fn is_cubic(&self) -> bool{
+        self.ndim() == 3 && (self.shape()[0] == self.shape()[1] && self.shape()[1] == self.shape()[2])
+    }
+
+    /// Is tensor nthbic?
+    pub fn is_nthbic(&self) -> bool{
+        self.shape().windows(2).all(|x| {x[0] == x[1]})
+    }
+
+    /// Solve for X in AX = B using gauss_jordan 
+    pub fn solve(&self, b: &Self) -> TensorResult<Self> {
+        self.same_device(b)?;
+        let n = self.is_square_check()?;
+        let vec_rhs = b.ndim() == 1;
+        let b2 = if vec_rhs { b.unsqueeze(1)? } else { b.clone() };
+        if b2.ndim() != 2 || b2.shape()[0] != n { return Err(TensorError::ShapeMismatch { op: "solve", lhs: self.shape().to_vec(), rhs: b.shape().to_vec() });}
+        let m = b2.shape()[1];
+        let mut av = self.to_vec()?;
+        let mut bv = b2.to_vec()?;
+        gauss_jordan(&mut av, n, &mut bv, m).ok_or_else(|| TensorError::Unsupported("Matrix is singular".into()))?;
+        let x = Tensor::from_vec(bv, &[n, m])?.to_device(self.device())?;
+        if vec_rhs { x.squeeze(1) } else { Ok(x) }
+    }
+
+    /// Computes the inverse of Tensor using [A|I] -> [I|A^-1]
+    pub fn inv(&self) -> TensorResult<Self> {
+        let n = self.is_square_check()?;
+        self.solve(&Tensor::<T>::eye(n).to_device(self.device())?)
+    }
+
+    /// Compute determinant of the matrix
+    pub fn det(&self) -> TensorResult<T> {
+        let n = self.is_square_check()?;
+        let mut av = self.to_vec()?;
+        Ok(gauss_jordan(&mut av, n, &mut vec![], 0).unwrap_or_else(T::zero))
+    }
+    
+    /// Computes nth degree normal of Tensor
+    /// 1st degree -> sum(|xi|) 
+    /// 2nd degree -> (sum(|xi|^2))^1/2
+    /// nth degree -> (sum(|xi|^n))^1/n
+    /// inf degree -> max(|xi|)
+    // Inf degree, support for p to be f64,and optimisation branch p = 1 and 2 suggested by AI
+    pub fn norm(&self, p: f64, dim: isize, keepdim: bool) -> TensorResult<Self> {
+        let a = self.abs()?;
+        if p.abs() <= 0.01{ return Err(TensorError::Custom(format!("Norm of {} is too close to zero and wil lead to unstable exponentiation",p)))}
+        if p.is_infinite() { a.max(dim, keepdim) }
+        else if p == 1.0 { a.sum(dim, keepdim) }
+        else if p == 2.0 { self.square()?.sum(dim, keepdim)?.sqrt() }
+        else { a.powf(T::from_f64(p))?.sum(dim, keepdim)?.powf(T::from_f64(1.0 / p)) }
+    }
+
+    /// L2 norm along dim
+    pub fn normalize(&self, dim: isize) -> TensorResult<Self> {
+        let n = self.norm(2.0, dim, true)?.add_scalar(T::from_f64(1e-12))?;
+        self.div(&n)
+    }
+
+    /// Cosine Similarity between two vectors
+    pub fn cosine_similarity(&self, rhs: &Self, dim: isize) -> TensorResult<Self> {
+        self.normalize(dim)?.mul(&rhs.normalize(dim)?)?.sum(dim, false)
+    }
+
+    /// Softmax of Tensor
+    pub fn softmax(&self, dim: isize) -> TensorResult<Self> {
+        match &*self.storage {
+            Storage::Cpu(_) => {
+                let e = self.sub(&self.max(dim, true)?)?.exp()?;
+                e.div(&e.sum(dim, true)?)
+            }
+            #[cfg(feature = "cuda")]
+            Storage::Cuda(_) => crate::cuda::softmax(self, normalize_dim(dim, self.ndim())?),
+        }
+    }
+
+    /// Log of sum of base e exponentials stabily 
+    // Find the largest elem and then sub all the elems by this max and use it for so we avoid exponential growth
+    pub fn logsumexp(&self, dim: isize, keepdim: bool) -> TensorResult<Self> {
+        let m = self.max(dim, true)?;
+        // Convert log(e^n-1 + e^n + e^n+1) -> n + log(e^-1+ e^0 + e^1)
+        let lse = self.sub(&m)?.exp()?.sum(dim, true)?.ln()?.add(&m)?;
+        if keepdim { Ok(lse) } else { lse.squeeze(dim) }
+    }
+
+    /// Logsoftmax of Tensor
+    pub fn log_softmax(&self, dim: isize) -> TensorResult<Self> {
+        self.sub(&self.logsumexp(dim, true)?)
+    }
+
+    /// Normalize over the last dim(mean = 0,var = 1)
+    pub fn layer_norm(&self, eps: T) -> TensorResult<Self> {
+        match &*self.storage {
+            Storage::Cpu(_) => {
+                let (mean,var) = (self.mean(-1, true)?,self.var(-1, true, false)?);
+                self.sub(&mean)?.div(&var.add_scalar(eps)?.sqrt()?)
+            }
+            #[cfg(feature = "cuda")]
+            Storage::Cuda(_) => crate::cuda::layer_norm(self, eps),
+        }
+    }
+    
+    /// Calculate the distance between two Tensors using p dim normalised distance
+    pub fn pdim_dist(&self,other: Tensor<T>,p:f64,dim:isize,keepdim: bool) -> TensorResult<Self>{
+        self.same_device(&other)?;
+        self.sub(&other)?.norm(p, dim, keepdim)
+    }
+
+    /// Calculate the manhatten distance between two tensors
+    pub fn manhatten(&self,other: Tensor<T>,dim:isize) -> TensorResult<Self>{
+        self.same_device(&other)?;
+        self.sub(&other)?.norm(1.0, dim, true)   
+    }
+
+    /// Calculate the euclidean distance between two tensors
+    pub fn euclidean(&self,other: Tensor<T>,dim:isize) -> TensorResult<Self>{
+        self.same_device(&other)?;
+        self.sub(&other)?.norm(2.0, dim, true)   
+    }
+
+}
